@@ -1,0 +1,479 @@
+#define BLYNK_TEMPLATE_ID "TMPL6p4JWAgsN"
+#define BLYNK_TEMPLATE_NAME "esp32"
+#define BLYNK_AUTH_TOKEN "CPu1tHlmgNLhIqzyCEaNq_NzGzsv3NbE"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <LiquidCrystal_I2C.h>
+#include <Wire.h>
+#include <EEPROM.h>
+#include <cstring>   // untuk memset()
+
+// ==================== WIFI ====================
+char ssid[] = "ADVAN MF01-855258";
+char pass[] = "1234567890";
+
+// ==================== PIN HARDWARE ====================
+#define RELAY_PIN       14
+#define LCD_ADDRESS     0x27
+#define LCD_COLUMNS     16
+#define LCD_ROWS        2
+#define RX_PIN          16
+#define TX_PIN          17
+
+// ==================== BLYNK VIRTUAL PINS ====================
+#define VPIN_SUHU_1      V0
+#define VPIN_SUHU_2      V8
+#define VPIN_HUM_1       V2
+#define VPIN_HUM_2       V3
+#define VPIN_MEDIA_1     V4
+#define VPIN_MEDIA_2     V5
+#define VPIN_DURASI      V6
+#define VPIN_RELAY       V1
+#define VPIN_STATUS      V10
+#define VPIN_PROFIL      V12
+#define VPIN_PROFIL_FB   V13
+
+// ==================== INTERVAL ====================
+const unsigned long POLL_INTERVAL = 30UL * 60 * 1000;
+const unsigned long RESTART_INTERVAL = 6UL * 3600 * 1000;
+unsigned long lastPollMaster = 0;
+
+// ==================== DOMAIN FUZZY ====================
+#define DURASI_MIN 0.0
+#define DURASI_MAX 15.0
+#define STEP 0.1
+#define RESOLUSI 151
+float agregasi[RESOLUSI];
+
+// ==================== PROFIL JAMUR ====================
+struct Profil {
+  float T_rendah_left, T_rendah_peak_a, T_rendah_peak_b, T_rendah_right;
+  float T_sedang_a, T_sedang_b, T_sedang_c, T_sedang_d;
+  float T_tinggi_left, T_tinggi_peak_a, T_tinggi_peak_b, T_tinggi_right;
+  float H_rendah_left, H_rendah_peak_a, H_rendah_peak_b, H_rendah_right;
+  float H_sedang_a, H_sedang_b, H_sedang_c, H_sedang_d;
+  float H_tinggi_left, H_tinggi_peak_a, H_tinggi_peak_b, H_tinggi_right;
+  float M_kering_right, M_basah_left;
+};
+
+const Profil profilJanggel = {
+  15, 15, 20, 23, 20, 23, 26, 30, 26, 30, 35, 35,
+  70, 70, 75, 80, 75, 80, 90, 95, 90, 95, 100, 101,
+  70, 40
+};
+const Profil profilBaru = {
+  25, 25, 30, 32, 30, 32, 35, 38, 35, 40, 45, 45,
+  60, 60, 70, 75, 70, 75, 85, 90, 85, 80, 95, 101,
+  70, 40
+};
+const Profil* profilAktif = &profilJanggel;
+
+// ==================== DATA SENSOR ====================
+struct SensorData {
+  float suhu = 0, kelembabanUdara = 0, kelembabanMedia = 0;
+  unsigned long lastUpdate = 0;
+  bool valid = false;
+};
+SensorData zona1, zona2;
+
+// ==================== FUNGSI FUZZY ====================
+float fuzzyTriangle(float x, float left, float peak, float right) {
+  if (x <= left || x >= right) return 0.0;
+  if (x <= peak) return (x - left) / (peak - left);
+  return (right - x) / (right - peak);
+}
+float fuzzyTrapezoid(float x, float a, float b, float c, float d) {
+  if (x <= a || x >= d) return 0.0;
+  if (x >= b && x <= c) return 1.0;
+  if (x < b) return (x - a) / (b - a);
+  return (d - x) / (d - c);
+}
+
+float fuzzySuhuRendah(float s) { return fuzzyTrapezoid(s, profilAktif->T_rendah_left, profilAktif->T_rendah_peak_a, profilAktif->T_rendah_peak_b, profilAktif->T_rendah_right); }
+float fuzzySuhuSedang(float s) { return fuzzyTrapezoid(s, profilAktif->T_sedang_a, profilAktif->T_sedang_b, profilAktif->T_sedang_c, profilAktif->T_sedang_d); }
+float fuzzySuhuTinggi(float s) { return fuzzyTrapezoid(s, profilAktif->T_tinggi_left, profilAktif->T_tinggi_peak_a, profilAktif->T_tinggi_peak_b, profilAktif->T_tinggi_right); }
+float fuzzyHumRendah(float h) { return fuzzyTrapezoid(h, profilAktif->H_rendah_left, profilAktif->H_rendah_peak_a, profilAktif->H_rendah_peak_b, profilAktif->H_rendah_right); }
+float fuzzyHumSedang(float h) { return fuzzyTrapezoid(h, profilAktif->H_sedang_a, profilAktif->H_sedang_b, profilAktif->H_sedang_c, profilAktif->H_sedang_d); }
+float fuzzyHumTinggi(float h) { return fuzzyTrapezoid(h, profilAktif->H_tinggi_left, profilAktif->H_tinggi_peak_a, profilAktif->H_tinggi_peak_b, profilAktif->H_tinggi_right); }
+float fuzzyMediaKering(float m) { if (m >= profilAktif->M_kering_right) return 0.0; return (profilAktif->M_kering_right - m) / profilAktif->M_kering_right; }
+float fuzzyMediaBasah(float m) { if (m <= profilAktif->M_basah_left) return 0.0; if (m >= 100.0) return 1.0; return (m - profilAktif->M_basah_left) / (100.0 - profilAktif->M_basah_left); }
+
+float tidak(float y) { if (y < 0.0 || y > 3.0) return 0.0; return (3.0 - y) / 3.0; }
+float cepat(float y) { if (y < 2.0 || y > 10.0) return 0.0; if (y <= 5.0) return (y - 2.0) / 3.0; return (10.0 - y) / 5.0; }
+float lama(float y) { if (y < 8.0 || y > 15.0) return 0.0; if (y <= 12.0) return (y - 8.0) / 4.0; return (15.0 - y) / 3.0; }
+
+float hitungDurasiGlobal() {
+  memset(agregasi, 0, sizeof(agregasi));
+  for (int z = 0; z < 2; z++) {
+    float s, h, m; bool ok = false;
+    if (z == 0 && zona1.valid) { s = zona1.suhu; h = zona1.kelembabanUdara; m = zona1.kelembabanMedia; ok = true; }
+    else if (z == 1 && zona2.valid) { s = zona2.suhu; h = zona2.kelembabanUdara; m = zona2.kelembabanMedia; ok = true; }
+    if (!ok) continue;
+
+    float sR = fuzzySuhuRendah(s), sS = fuzzySuhuSedang(s), sT = fuzzySuhuTinggi(s);
+    float hR = fuzzyHumRendah(h), hS = fuzzyHumSedang(h), hT = fuzzyHumTinggi(h);
+    float mK = fuzzyMediaKering(m), mB = fuzzyMediaBasah(m);
+
+    struct { float* m; float* s; float* h; int out; } aturan[18] = {
+      {&mB, &sT, &hR, 1}, {&mB, &sT, &hS, 1}, {&mB, &sT, &hT, 0},
+      {&mB, &sS, &hR, 1}, {&mB, &sS, &hS, 0}, {&mB, &sS, &hT, 0},
+      {&mB, &sR, &hR, 0}, {&mB, &sR, &hS, 0}, {&mB, &sR, &hT, 0},
+      {&mK, &sT, &hR, 2}, {&mK, &sT, &hS, 2}, {&mK, &sT, &hT, 2},
+      {&mK, &sS, &hR, 2}, {&mK, &sS, &hS, 2}, {&mK, &sS, &hT, 1},
+      {&mK, &sR, &hR, 1}, {&mK, &sR, &hS, 1}, {&mK, &sR, &hT, 1}
+    };
+
+    for (int i = 0; i < 18; i++) {
+      float a = *(aturan[i].m), b = *(aturan[i].s), c = *(aturan[i].h);
+      float alpha = min(a, min(b, c));
+      if (alpha == 0.0) continue;
+      for (int j = 0; j < RESOLUSI; j++) {
+        float y = DURASI_MIN + j * STEP, muAsli;
+        if (aturan[i].out == 0) muAsli = tidak(y);
+        else if (aturan[i].out == 1) muAsli = cepat(y);
+        else muAsli = lama(y);
+        agregasi[j] = max(agregasi[j], min(alpha, muAsli));
+      }
+    }
+  }
+  float num = 0, den = 0;
+  for (int j = 0; j < RESOLUSI; j++) {
+    float y = DURASI_MIN + j * STEP, mu = agregasi[j];
+    num += y * mu; den += mu;
+  }
+  return (den == 0) ? 0 : num / den;
+}
+
+// ==================== RELAY ====================
+bool relayState = false;
+unsigned long relayStart = 0;
+float durasiRelay = 0;
+bool manualOverride = false;
+bool manualRelayState = false;
+
+// ==================== LCD ====================
+LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLUMNS, LCD_ROWS);
+
+// ==================== WIFI & BLYNK ====================
+unsigned long lastWifiCheck = 0;
+const unsigned long WIFI_CHECK_INTERVAL = 5000;
+unsigned long lastBlynkReconnect = 0;
+const unsigned long BLYNK_RECONNECT_INTERVAL = 10000;
+int wifiReconnectAttempts = 0;
+bool blynkSentProfile = false;
+
+bool blynkDataReady = false;  // Flag untuk menandakan ada data baru siap dikirim ke Blynk
+
+// --------------- Fungsi Reconnect dengan LCD ---------------
+void cekDanReconnectWiFi() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WIFI] Koneksi WiFi terputus!");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi Terputus!");
+    lcd.setCursor(0, 1);
+    lcd.print("Reconnecting...");
+    
+    WiFi.disconnect(); delay(100);
+    WiFi.begin(ssid, pass);
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+      delay(500);
+      Serial.print(".");
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\nWiFi reconnected!");
+      wifiReconnectAttempts = 0;
+      lcd.setCursor(0, 15);
+      lcd.print("w");
+      delay(1500);
+    } else {
+      Serial.println("\nWiFi reconnect failed!");
+      wifiReconnectAttempts++;
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("WiFi Gagal!");
+      delay(1500);
+    }
+  }
+}
+
+void cekDanReconnectBlynk() {
+  if (WiFi.status() == WL_CONNECTED && !Blynk.connected()) {
+    Serial.println("[BLYNK] Reconnecting...");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Blynk Reconnect");
+    lcd.setCursor(0, 1);
+    lcd.print("Please wait...");
+    
+    Blynk.connect();
+    if (Blynk.connected()) {
+      Serial.println("Blynk reconnected!");
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Blynk Ready");
+      delay(1000);
+    } else {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Blynk Gagal!");
+      delay(1000);
+    }
+    blynkSentProfile = false;
+  }
+}
+
+// ==================== BLYNK HANDLER ====================
+BLYNK_WRITE(VPIN_RELAY) {
+  manualRelayState = param.asInt();
+  manualOverride = true;
+}
+
+BLYNK_WRITE(VPIN_PROFIL) {
+  int p = param.asInt();
+  if (p == 1) { profilAktif = &profilJanggel; EEPROM.write(0, 1); }
+  else if (p == 2) { profilAktif = &profilBaru; EEPROM.write(0, 2); }
+  EEPROM.commit();
+  Blynk.virtualWrite(VPIN_PROFIL_FB, p);
+  Blynk.virtualWrite(VPIN_STATUS, p == 1 ? "Profil: Janggel" : "Profil: Baru");
+}
+
+// ==================== PARSING UART ====================
+String uartBuffer = "";
+void parseData(String data) {
+  data.trim();
+  if (data.startsWith("STATUS")) return;
+  int c1 = data.indexOf(','), c2 = data.indexOf(',', c1+1), c3 = data.indexOf(',', c2+1);
+  if (c1==-1 || c2==-1 || c3==-1) return;
+  int zona = data.substring(0,c1).toInt();
+  float su = data.substring(c1+1,c2).toFloat();
+  float hu = data.substring(c2+1,c3).toFloat();
+  float me = data.substring(c3+1).toFloat();
+  if (zona == 1) {
+    zona1.suhu = su; zona1.kelembabanUdara = hu; zona1.kelembabanMedia = me;
+    zona1.lastUpdate = millis(); zona1.valid = true;
+  } else if (zona == 2) {
+    zona2.suhu = su; zona2.kelembabanUdara = hu; zona2.kelembabanMedia = me;
+    zona2.lastUpdate = millis(); zona2.valid = true;
+  }
+  durasiRelay = hitungDurasiGlobal();
+  
+  // Tandai bahwa ada data baru siap dikirim ke Blynk
+  blynkDataReady = true;
+}
+
+// ==================== LCD ====================
+unsigned long lastLCD = 0;
+int page = 0;
+void updateLCD() {
+  // Hanya update tampilan data jika WiFi dalam keadaan normal (tidak sedang reconnect)
+  // Agar tidak menimpa pesan reconnect, kita bisa tambahkan flag, tapi sederhana saja:
+  // Kita manfaatkan millis() untuk menghindari konflik. Pesan reconnect akan menimpa layar.
+  // Ini tidak masalah karena reconnect hanya sementara.
+  if (millis() - lastLCD > 3000) {
+    page = !page;
+    lastLCD = millis();
+  }
+  lcd.clear();
+  if (page == 0 && zona1.valid) {
+    lcd.setCursor(0,0); lcd.print("Z1:"); lcd.print(zona1.suhu,1); lcd.print("C");
+    lcd.setCursor(0,1); lcd.print("H:"); lcd.print(zona1.kelembabanUdara,0); lcd.print("% M:"); lcd.print(zona1.kelembabanMedia,0);
+  } else if (zona2.valid) {
+    lcd.setCursor(0,0); lcd.print("Z2:"); lcd.print(zona2.suhu,1); lcd.print("C");
+    lcd.setCursor(0,1); lcd.print("H:"); lcd.print(zona2.kelembabanUdara,0); lcd.print("% M:"); lcd.print(zona2.kelembabanMedia,0);
+  }
+  // Indikator WiFi & relay
+  if (WiFi.status() == WL_CONNECTED) {
+    lcd.setCursor(0, 0);
+    lcd.print("Wifi Connected");
+  }
+  lcd.setCursor(0, 1);
+  lcd.print(relayState ? "Relay" : " ");
+}
+
+// ==================== KIRIM BLYNK ====================
+unsigned long lastBlynkSend = 0;
+void kirimBlynk() {
+  if (Blynk.connected()) {
+    Blynk.virtualWrite(VPIN_SUHU_1, zona1.suhu);
+    Blynk.virtualWrite(VPIN_HUM_1, zona1.kelembabanUdara);
+    Blynk.virtualWrite(VPIN_MEDIA_1, zona1.kelembabanMedia);
+    Blynk.virtualWrite(VPIN_SUHU_2, zona2.suhu);
+    Blynk.virtualWrite(VPIN_HUM_2, zona2.kelembabanUdara);
+    Blynk.virtualWrite(VPIN_MEDIA_2, zona2.kelembabanMedia);
+    Blynk.virtualWrite(VPIN_DURASI, durasiRelay);
+    Blynk.virtualWrite(VPIN_RELAY, relayState);
+  }
+}
+
+// ==================== SETUP ====================
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("\n=== MULAI SETUP ===");
+
+  Serial2.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);
+  Serial.println("Serial2 OK");
+
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+  Serial.println("Relay OK");
+
+  EEPROM.begin(1);
+  int p = EEPROM.read(0);
+  if (p == 2) profilAktif = &profilBaru;
+  Serial.print("Profil aktif: "); Serial.println(p == 2 ? "Baru" : "Janggel");
+
+  Wire.begin();
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("ESPController");
+  lcd.setCursor(0, 1);
+  lcd.print("Starting...");
+  Serial.println("LCD OK");
+
+  // ---------- WiFi ----------
+  Serial.println("Menghubungkan ke WiFi...");
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting WiFi");
+  lcd.setCursor(0, 1);
+  lcd.print("Tunggu...");
+  
+  WiFi.begin(ssid, pass);
+  unsigned long startAttempt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 15000) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi terhubung!");
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi OK");
+    lcd.setCursor(0, 1);
+    lcd.print(WiFi.localIP().toString().c_str());
+    delay(1500);
+    
+    // Blynk
+    Serial.println("Menghubungkan Blynk...");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Blynk Starting");
+    Blynk.config(BLYNK_AUTH_TOKEN);
+    Blynk.connect();
+    if (Blynk.connected()) {
+      Serial.println("Blynk terhubung!");
+      lcd.setCursor(0, 1);
+      lcd.print("Connected");
+    } else {
+      Serial.println("Blynk belum terhubung (coba lagi nanti)");
+      lcd.setCursor(0, 1);
+      lcd.print("Menunggu...");
+    }
+    delay(1000);
+  } else {
+    Serial.println("\nWiFi gagal!");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi Failed!");
+    lcd.setCursor(0, 1);
+    lcd.print("Cek konfigurasi");
+    delay(2000);
+  }
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Siap");
+  Serial.println("Setup selesai.\n");
+  lastPollMaster = 0;
+}
+
+// ==================== LOOP ====================
+void loop() {
+  Blynk.run();
+
+  // Cek koneksi WiFi & Blynk
+  if (millis() - lastWifiCheck >= WIFI_CHECK_INTERVAL) {
+    lastWifiCheck = millis();
+    cekDanReconnectWiFi();
+  }
+  if (WiFi.status() == WL_CONNECTED && !Blynk.connected()) {
+    if (millis() - lastBlynkReconnect >= BLYNK_RECONNECT_INTERVAL) {
+      lastBlynkReconnect = millis();
+      cekDanReconnectBlynk();
+    }
+  }
+
+  // Kirim profil saat baru konek
+  if (Blynk.connected() && !blynkSentProfile) {
+    blynkSentProfile = true;
+    int current = (profilAktif == &profilBaru) ? 2 : 1;
+    Blynk.virtualWrite(VPIN_PROFIL_FB, current);
+    Blynk.virtualWrite(VPIN_STATUS, current == 1 ? "Profil: Janggel" : "Profil: Baru");
+  } else if (!Blynk.connected()) {
+    blynkSentProfile = false;
+  }
+
+  // Polling UART 30 menit
+  if (millis() - lastPollMaster >= POLL_INTERVAL) {
+    lastPollMaster = millis();
+    Serial2.print("GETDATA\n");
+  }
+
+  // Baca data dari UART
+  while (Serial2.available()) {
+    char c = Serial2.read();
+    if (c == '\n') { parseData(uartBuffer); uartBuffer = ""; }
+    else uartBuffer += c;
+  }
+
+  // Kontrol relay
+  if (manualOverride) {
+    if (manualRelayState && !relayState) {
+      digitalWrite(RELAY_PIN, HIGH); relayState = true;
+    } else if (!manualRelayState && relayState) {
+      digitalWrite(RELAY_PIN, LOW); relayState = false;
+      manualOverride = false; // kembali otomatis
+    }
+  } else {
+    if (durasiRelay > 0 && !relayState && (zona1.valid || zona2.valid)) {
+      digitalWrite(RELAY_PIN, HIGH); relayState = true; relayStart = millis();
+    }
+    if (relayState && millis() - relayStart >= durasiRelay * 1000) {
+      digitalWrite(RELAY_PIN, LOW); relayState = false; durasiRelay = 0;
+    }
+  }
+
+  updateLCD();
+
+//  if (millis() - lastBlynkSend >= 2000) {
+//    lastBlynkSend = millis();
+//    kirimBlynk();
+//  }
+
+  // Timeout sensor
+  if (zona1.valid && millis() - zona1.lastUpdate > 30000) zona1.valid = false;
+  if (zona2.valid && millis() - zona2.lastUpdate > 30000) zona2.valid = false;
+
+  // Restart tiap 6 jam
+  if (millis() > RESTART_INTERVAL) {
+    Serial.println("Restart setelah 6 jam...");
+    delay(100);
+    ESP.restart();
+  }
+  // Kirim ke Blynk hanya jika ada data baru dan Blynk terhubung
+  if (blynkDataReady && Blynk.connected()) {
+      kirimBlynk();
+      blynkDataReady = false;  // Reset flag setelah dikirim
+  }
+
+  delay(10);
+}
