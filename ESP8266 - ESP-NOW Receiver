@@ -1,0 +1,251 @@
+/*
+ * ESP8266 - ESP-NOW Receiver + UART (with EEPROM)
+ * - Menyimpan data terakhir dari 2 zona di EEPROM
+ * - Data dikirim ke ESP32 hanya saat diminta (GETDATA)
+ * - Setelah dikirim, data dihapus dari EEPROM (mencegah data basi)
+ */
+
+#include <ESP8266WiFi.h>
+#include <espnow.h>
+#include <EEPROM.h>
+
+// ==================== KONFIGURASI WAKTU ====================
+const unsigned long TIMEOUT_MS = 120000;          // timeout lokal (2 menit)
+
+// ==================== STRUKTUR DATA ESP-NOW ====================
+typedef struct struct_sensorData {
+  uint8_t zona;
+  float suhu;
+  float kelembabanUdara;
+  int kelembabanMedia;
+  unsigned long timestamp;
+} struct_sensorData;
+
+// ==================== DATA PER ZONA (RAM + EEPROM) ====================
+typedef struct {
+  bool hasData;         // status di RAM (bisa berbeda dgn EEPROM, tapi kita sinkronkan)
+  float suhu;
+  float kelembabanUdara;
+  int kelembabanMedia;  // sudah dikalibrasi ke %
+  unsigned long timestamp;
+  unsigned long lastUpdate;
+} ZonaData;
+
+ZonaData zona[3];
+
+// ==================== KALIBRASI SOIL ====================
+const int SOIL_DRY_ADC = 700;  // sesuaikan
+const int SOIL_WET_ADC = 300;
+
+// ==================== ALAMAT EEPROM ====================
+#define EEPROM_ADDR_Z1   0     // zona 1: 17 byte
+#define EEPROM_ADDR_Z2   17    // zona 2: 17 byte
+#define EEPROM_SIZE      34    // total 2 * 17
+
+// ==================== FUNGSI EEPROM ====================
+void saveToEEPROM(int z) {
+  int addr = (z == 1) ? EEPROM_ADDR_Z1 : EEPROM_ADDR_Z2;
+  EEPROM.write(addr, 1);               // valid = true
+  addr += 1;
+  // Simpan suhu (float)
+  memcpy(&EEPROM[addr], &zona[z].suhu, sizeof(float));
+  addr += sizeof(float);
+  memcpy(&EEPROM[addr], &zona[z].kelembabanUdara, sizeof(float));
+  addr += sizeof(float);
+  // Simpan media (int)
+  int media = zona[z].kelembabanMedia;
+  memcpy(&EEPROM[addr], &media, sizeof(int));
+  addr += sizeof(int);
+  // Timestamp (optional)
+  memcpy(&EEPROM[addr], &zona[z].timestamp, sizeof(unsigned long));
+  EEPROM.commit();
+}
+
+void clearEEPROM(int z) {
+  int addr = (z == 1) ? EEPROM_ADDR_Z1 : EEPROM_ADDR_Z2;
+  EEPROM.write(addr, 0);  // valid = false
+  EEPROM.commit();
+}
+
+bool readFromEEPROM(int z) {
+  int addr = (z == 1) ? EEPROM_ADDR_Z1 : EEPROM_ADDR_Z2;
+  if (EEPROM.read(addr) != 1) return false;  // data tidak valid
+  addr += 1;
+  // Baca suhu
+  memcpy(&zona[z].suhu, &EEPROM[addr], sizeof(float));
+  addr += sizeof(float);
+  memcpy(&zona[z].kelembabanUdara, &EEPROM[addr], sizeof(float));
+  addr += sizeof(float);
+  int media;
+  memcpy(&media, &EEPROM[addr], sizeof(int));
+  zona[z].kelembabanMedia = media;
+  addr += sizeof(int);
+  memcpy(&zona[z].timestamp, &EEPROM[addr], sizeof(unsigned long));
+  zona[z].hasData = true;
+  return true;
+}
+
+// ==================== KIRIM VIA UART ====================
+void sendToESP32(String data) {
+  Serial.println(data);
+  Serial.print("[UART TX] ");
+  Serial.println(data);
+}
+
+// ==================== KIRIM STATUS ====================
+void sendStatusNotification() {
+  String s = "STATUS,";
+  s += (zona[1].hasData ? "Z1_OK" : "Z1_NO_DATA");
+  s += ",";
+  s += (zona[2].hasData ? "Z2_OK" : "Z2_NO_DATA");
+  s += ",";
+  s += ((zona[1].hasData && zona[2].hasData) ? "READY" : "NOT_READY");
+  sendToESP32(s);
+}
+
+// ==================== KIRIM KEDUA ZONA (DARI EEPROM) ====================
+void sendBothZonesDataToESP32() {
+  if (!zona[1].hasData || !zona[2].hasData) {
+    sendStatusNotification();
+    return;
+  }
+
+  String out1 = "1," + String(zona[1].suhu, 2) + "," +
+                String(zona[1].kelembabanUdara, 2) + "," +
+                String(zona[1].kelembabanMedia);
+  sendToESP32(out1);
+  delay(10);
+
+  String out2 = "2," + String(zona[2].suhu, 2) + "," +
+                String(zona[2].kelembabanUdara, 2) + "," +
+                String(zona[2].kelembabanMedia);
+  sendToESP32(out2);
+
+  // Setelah data dikirim, hapus dari EEPROM (dan invalidasi data di RAM)
+  clearEEPROM(1);
+  clearEEPROM(2);
+  zona[1].hasData = false;
+  zona[2].hasData = false;
+
+  Serial.println("[INFO] Data sent and cleared from EEPROM. Waiting for new data...");
+}
+
+// ==================== SIMPAN DATA DARI ESP-NOW ====================
+void saveZonaData(struct_sensorData data) {
+  uint8_t z = data.zona;
+  if (z < 1 || z > 2) return;
+
+  // Kalibrasi media
+  int mediaPersen = map(data.kelembabanMedia, SOIL_DRY_ADC, SOIL_WET_ADC, 0, 100);
+  mediaPersen = constrain(mediaPersen, 0, 100);
+
+  zona[z].hasData = true;
+  zona[z].suhu = data.suhu;
+  zona[z].kelembabanUdara = data.kelembabanUdara;
+  zona[z].kelembabanMedia = mediaPersen;
+  zona[z].timestamp = data.timestamp;
+  zona[z].lastUpdate = millis();
+
+  // Simpan ke EEPROM
+  saveToEEPROM(z);
+
+  // Jika kedua zona sudah ada data di EEPROM, flag siap
+  if (readFromEEPROM(1) && readFromEEPROM(2)) {
+    // bothZonesHaveData = true; (tidak diperlukan flag terpisah, cek langsung dari EEPROM)
+  }
+}
+
+// ==================== ESP-NOW CALLBACK ====================
+void onDataRecv(uint8_t *mac, uint8_t *incomingDataBytes, uint8_t len) {
+  if (len != sizeof(struct_sensorData)) return;
+  struct_sensorData incomingData;
+  memcpy(&incomingData, incomingDataBytes, sizeof(incomingData));
+
+  Serial.print("[ESP-NOW] Data dari zona ");
+  Serial.print(incomingData.zona);
+  Serial.print(": ");
+  Serial.print(incomingData.suhu);
+  Serial.println("°C");
+
+
+
+  saveZonaData(incomingData);
+}
+
+// ==================== BACA PERINTAH GETDATA ====================
+String serialBuffer = "";
+void checkSerialCommand() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n') {
+      serialBuffer.trim();
+      if (serialBuffer.equals("GETDATA")) {
+        Serial.println("[CMD] Received GETDATA");
+        // Kirim data jika EEPROM kedua zona valid
+        bool z1ok = readFromEEPROM(1);
+        bool z2ok = readFromEEPROM(2);
+        if (z1ok && z2ok) {
+          sendBothZonesDataToESP32();
+        } else {
+          sendStatusNotification();  // beri tahu bahwa data belum lengkap
+        }
+      }
+      serialBuffer = "";
+    } else {
+      serialBuffer += c;
+    }
+  }
+}
+
+// ==================== SETUP ====================
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("\nESP8266 + EEPROM (Auto-clear after GETDATA)");
+
+  EEPROM.begin(EEPROM_SIZE);
+
+  // Pulihkan status dari EEPROM
+  bool z1 = readFromEEPROM(1);
+  bool z2 = readFromEEPROM(2);
+  Serial.print("EEPROM status - Z1: ");
+  Serial.print(z1 ? "OK" : "empty");
+  Serial.print(" Z2: ");
+  Serial.println(z2 ? "OK" : "empty");
+
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != 0) {
+    Serial.println("ESP-NOW init failed");
+    return;
+  }
+  esp_now_set_self_role(ESP_NOW_ROLE_SLAVE);
+  esp_now_register_recv_cb(onDataRecv);
+  Serial.println("Ready.");
+}
+
+// ==================== LOOP ====================
+void loop() {
+  checkSerialCommand();
+
+  // Timeout lokal (hanya untuk debugging)
+  for (int i = 1; i <= 2; i++) {
+    if (zona[i].hasData && millis() - zona[i].lastUpdate > TIMEOUT_MS) {
+      Serial.print("[WARN] Zona "); Serial.print(i); Serial.println(" stale");
+    }
+  }
+  
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd.equals("READ")) {
+      bool z1 = readFromEEPROM(1);
+      bool z2 = readFromEEPROM(2);
+      Serial.print("Z1: ");
+      Serial.print(z1 ? zona[1].suhu : 0);
+      Serial.print("°C, Z2: ");
+      Serial.println(z2 ? zona[2].suhu : 0);
+    }
+  }
+
+  delay(10);
+}
