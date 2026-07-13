@@ -1,0 +1,233 @@
+/*
+ * SLAVE ESP8266 - LIGHT SLEEP FIXED
+ * Bekerja untuk 1 menit DAN 5 menit
+ */
+
+#include <ESP8266WiFi.h>
+#include <espnow.h>
+#include <DHT.h>
+
+// ==================== KONFIGURASI ====================
+#define DHTPIN          12
+#define DHTTYPE         DHT22
+#define SOIL_PIN        A0
+#define ZONA_ID         2
+
+uint8_t masterMac[] = {0x68, 0xC6, 0x3A, 0xF7, 0x01, 0x49};
+
+// Sleep duration dalam MIKRODETIK
+// 1 menit = 60,000,000 (60e6)
+// 5 menit = 300,000,000 (300e6)
+const uint32_t SLEEP_US = 60000000;  // Ganti ke 300000000 untuk 5 menit
+
+// Flag untuk status sleep
+volatile bool wifi_sleeping = false;
+
+DHT dht(DHTPIN, DHTTYPE);
+
+typedef struct struct_sensorData {
+  uint8_t zona;
+  float suhu;
+  float kelembabanUdara;
+  int kelembabanMedia;
+  unsigned long timestamp;
+} struct_sensorData;
+
+struct_sensorData dataKirim;
+
+// ==================== FUNGSI BACA SENSOR ====================
+float bacaSuhu() {
+  float suhu = dht.readTemperature();
+  if (isnan(suhu)) {
+    Serial.println("[ERROR] Gagal baca suhu!");
+    return 0.0;
+  }
+  return suhu;
+}
+
+float bacaKelembabanUdara() {
+  float humidity = dht.readHumidity();
+  if (isnan(humidity)) {
+    Serial.println("[ERROR] Gagal baca kelembaban!");
+    return 0.0;
+  }
+  return humidity;
+}
+
+int bacaKelembabanMedia() {
+  return analogRead(SOIL_PIN);
+}
+
+// ==================== CALLBACK ESP-NOW ====================
+void OnDataSent(uint8_t *mac_addr, uint8_t sendStatus) {
+  if (sendStatus == 0) {
+    Serial.println("[OK] Data terkirim ke master");
+  } else {
+    Serial.println("[GAGAL] Kirim data gagal");
+  }
+}
+
+// ==================== INISIALISASI ULANG ESP-NOW ====================
+bool initESPNow() {
+  // Matikan WiFi dulu total
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+  
+  // Mode station
+  WiFi.mode(WIFI_STA);
+  delay(100);
+  
+  // ESP-NOW init
+  if (esp_now_init() != 0) {
+    Serial.println("[ERROR] ESP-NOW init gagal");
+    return false;
+  }
+  
+  esp_now_set_self_role(ESP_NOW_ROLE_CONTROLLER);
+  esp_now_register_send_cb(OnDataSent);
+  
+  if (esp_now_add_peer(masterMac, ESP_NOW_ROLE_SLAVE, 1, NULL, 0) != 0) {
+    Serial.println("[ERROR] Gagal add peer");
+    return false;
+  }
+  
+  Serial.println("[OK] ESP-NOW siap");
+  return true;
+}
+
+// ==================== KIRIM DATA ====================
+void kirimData() {
+  dataKirim.zona = ZONA_ID;
+  dataKirim.suhu = bacaSuhu();
+  dataKirim.kelembabanUdara = bacaKelembabanUdara();
+  dataKirim.kelembabanMedia = bacaKelembabanMedia();
+  dataKirim.timestamp = millis();
+  
+  esp_now_send(masterMac, (uint8_t *) &dataKirim, sizeof(dataKirim));
+  
+  Serial.println("=== DATA TERKIRIM ===");
+  Serial.print("Zona: "); Serial.println(dataKirim.zona);
+  Serial.print("Suhu: "); Serial.print(dataKirim.suhu); Serial.println(" °C");
+  Serial.print("Kelembaban Udara: "); Serial.print(dataKirim.kelembabanUdara); Serial.println(" %");
+  Serial.print("Kelembaban Media: "); Serial.println(dataKirim.kelembabanMedia);
+  Serial.println("=====================");
+}
+
+// ==================== FUNGSI ESP_DELAY YANG BENAR ====================
+// Fungsi ini diperlukan untuk light sleep yang benar
+void esp_delay(uint32_t ms, std::function<bool()> wakeup_condition) {
+  uint32_t start = millis();
+  while (millis() - start < ms) {
+    if (wakeup_condition && wakeup_condition()) {
+      break;
+    }
+    delay(1);
+  }
+}
+
+// ==================== LIGHT SLEEP ====================
+void masukLightSleep() {
+  Serial.print("[SLEEP] Akan tidur selama ");
+  Serial.print(SLEEP_US / 1000000);
+  Serial.println(" detik");
+  Serial.flush();
+  
+  // STEP 1: Matikan semua timer interrupt
+  extern os_timer_t *timer_list;
+  timer_list = nullptr;
+  
+  // STEP 2: Disconnect WiFi
+  wifi_station_disconnect();
+  wifi_set_opmode(NULL_MODE);
+  
+  // STEP 3: Set sleep type
+  wifi_fpm_set_sleep_type(LIGHT_SLEEP_T);
+  
+  // STEP 4: Buka mode sleep
+  wifi_fpm_open();
+  
+  // STEP 5: Set flag dan mulai sleep
+  wifi_sleeping = true;
+  
+  // STEP 6: Callback wakeup
+  wifi_fpm_set_wakeup_cb([]() {
+    Serial.begin(115200);
+    Serial.println("[WAKE UP] Callback terpanggil!");
+    Serial.flush();
+    wifi_fpm_close();
+    wifi_set_opmode(STATION_MODE);
+    wifi_station_connect();
+    wifi_sleeping = false;
+  });
+  
+  // STEP 7: Mulai sleep
+  wifi_fpm_do_sleep(SLEEP_US);
+  
+  // STEP 8: Delay KRITIS - harus lebih lama dari total sleep + 460ms
+  // Untuk sleep 60 detik, delay 61 detik
+  // Untuk sleep 5 menit, delay 301 detik
+  uint32_t totalDelayMs = (SLEEP_US / 1000) + 500;  // +500ms buffer
+  
+  uint32_t startTime = millis();
+  while (millis() - startTime < totalDelayMs) {
+    if (!wifi_sleeping) break;
+    delay(1);
+  }
+  
+  // STEP 9: Tutup mode sleep jika belum ditutup callback
+  if (wifi_sleeping) {
+    wifi_fpm_close();
+    wifi_set_opmode(STATION_MODE);
+    wifi_sleeping = false;
+  }
+  
+  Serial.println("[WAKE UP] Bangun dari light sleep!");
+}
+
+// ==================== SETUP ====================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n=================================");
+  Serial.println("SLAVE LIGHT SLEEP - FIXED VERSION");
+  Serial.print("Sleep duration: ");
+  Serial.print(SLEEP_US / 1000000);
+  Serial.println(" detik");
+  Serial.println("=================================");
+  
+  // Inisialisasi sensor
+  dht.begin();
+  pinMode(SOIL_PIN, INPUT);
+  
+  // Inisialisasi ESP-NOW
+  if (!initESPNow()) {
+    Serial.println("[FATAL] ESP-NOW gagal, restart...");
+    ESP.restart();
+  }
+  
+  Serial.print("MAC Address Slave: ");
+  Serial.println(WiFi.macAddress());
+  
+  Serial.println("[INIT] Siap beroperasi\n");
+  
+  // Kirim data pertama
+  delay(1000);
+  kirimData();
+}
+
+// ==================== LOOP ====================
+void loop() {
+  // Kirim data
+  kirimData();
+  
+  // Flush serial
+  delay(100);
+  Serial.flush();
+  
+  // Masuk light sleep
+  masukLightSleep();
+  
+  // Re-inisialisasi ESP-NOW setelah bangun
+  delay(500);
+  initESPNow();
+}
